@@ -78,6 +78,7 @@ def ensure_comfy(root: Path, source_version: str) -> None:
     dest = root / "ComfyUI"
     if dest.is_dir() and (dest / "main.py").is_file() and installed_comfy_version(dest) == source_version:
         info(f"ComfyUI {source_version} is already present.")
+        patch_browser_cors(dest)
         return
     if dest.exists() and not (dest / ".git").is_dir():
         die(f"{dest} exists but is not a ComfyUI git checkout. Move that folder aside and run the installer again.")
@@ -91,6 +92,7 @@ def ensure_comfy(root: Path, source_version: str) -> None:
         run([git, "fetch", "--depth", "1", "origin", "tag", source_version], cwd=dest)
         run([git, "checkout", "--detach", source_version], cwd=dest)
     (dest / ".aksho-version").write_text(source_version + "\n", encoding="utf-8")
+    patch_browser_cors(dest)
 
 
 def pip_install(python: Path, packages: list[str]) -> None:
@@ -106,6 +108,65 @@ def install_runtime_packages(python: Path, comfy_dir: Path) -> None:
     pip_install(python, ["torch", "torchvision"])
     info("Installing ComfyUI's Python packages. The first run takes a while...")
     pip_install(python, ["-r", str(comfy_dir / "requirements.txt")])
+
+
+def patch_browser_cors(comfy_dir: Path) -> None:
+    """Let https://akshoai.com call this loopback server from Safari and Chrome.
+
+    ComfyUI's CORS middleware answers with Allow-Origin * and Allow-Credentials
+    true, and it never sets Allow-Private-Network. Browsers reject that pair,
+    and they also refuse a public site's request to 127.0.0.1 without the
+    private-network header. Re-applied after every checkout because the edit
+    lives in ComfyUI's own server.py.
+    """
+    path = comfy_dir / "server.py"
+    text = path.read_text(encoding="utf-8")
+    original = text
+    if "response.headers['Access-Control-Allow-Private-Network']" not in text:
+        old = """        response.headers['Access-Control-Allow-Origin'] = allowed_origin
+        response.headers['Access-Control-Allow-Methods'] = 'POST, GET, DELETE, PUT, OPTIONS, PATCH'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response"""
+        new = """        # Browsers reject Allow-Origin * together with Allow-Credentials.
+        # Echo the calling origin so https://akshoai.com can read the response.
+        request_origin = request.headers.get("Origin")
+        if allowed_origin == "*" and request_origin:
+            response.headers['Access-Control-Allow-Origin'] = request_origin
+            response.headers['Vary'] = 'Origin'
+        else:
+            response.headers['Access-Control-Allow-Origin'] = allowed_origin
+        response.headers['Access-Control-Allow-Methods'] = 'POST, GET, DELETE, PUT, OPTIONS, PATCH'
+        requested_headers = request.headers.get("Access-Control-Request-Headers")
+        response.headers['Access-Control-Allow-Headers'] = requested_headers or 'Content-Type, Authorization'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        # Safari and Chrome block public sites from calling 127.0.0.1 unless
+        # the preflight explicitly allows private-network access.
+        response.headers['Access-Control-Allow-Private-Network'] = 'true'
+        return response"""
+        if old not in text:
+            raise SystemExit(f"Could not patch CORS in {path}. ComfyUI's middleware changed.")
+        text = text.replace(old, new, 1)
+    ws_old = """            ws = web.WebSocketResponse()
+            await ws.prepare(request)"""
+    ws_new = """            ws = web.WebSocketResponse()
+            # The 101 response is written inside prepare(), before the CORS
+            # middleware can add headers. Firefox drops the live channel unless
+            # the private-network permission is already on this handshake.
+            origin = request.headers.get("Origin")
+            if origin:
+                ws.headers["Access-Control-Allow-Origin"] = origin
+                ws.headers["Vary"] = "Origin"
+            ws.headers["Access-Control-Allow-Private-Network"] = "true"
+            await ws.prepare(request)"""
+    if 'ws.headers["Access-Control-Allow-Private-Network"]' not in text:
+        if ws_old not in text:
+            raise SystemExit(f"Could not patch the WebSocket handshake in {path}.")
+        text = text.replace(ws_old, ws_new, 1)
+    if text == original:
+        return
+    path.write_text(text, encoding="utf-8")
+    info("Patched ComfyUI so browsers can reach localhost.")
 
 
 def assert_mps(python: Path) -> None:

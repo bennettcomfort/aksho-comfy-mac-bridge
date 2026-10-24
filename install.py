@@ -35,11 +35,16 @@ import bootstrap_comfy
 PORTABLE_ID = "comfyui-portable"
 DEFAULT_BASE_URL = "https://dl.akshoai.com"
 COMFY_PORT = 8188
+# ComfyUI listens here. browser_bridge.py owns COMFY_PORT and accepts the
+# HTTPS connections Safari sends to that same public port.
+COMFY_INTERNAL_PORT = 18188
 ATELIER_URL = "https://akshoai.com/atelier"
 # Kept in sync with the Run .command scripts.
 COMFY_ARGS = [
     "--port",
-    str(COMFY_PORT),
+    str(COMFY_INTERNAL_PORT),
+    "--listen",
+    "127.0.0.1",
     "--enable-cors-header",
     "--enable-assets",
     "--enable-asset-hashing",
@@ -50,6 +55,7 @@ COMFY_ARGS = [
 LAUNCHER_NAMES = (
     "install.py",
     "bootstrap_comfy.py",
+    "browser_bridge.py",
     "mac-env.sh",
 )
 # fp8 text encoders crash on MPS with ComfyUI v0.38.0 (no float8 kernels).
@@ -414,12 +420,18 @@ cd "$ROOT"
 
 def write_launchers(root: Path) -> None:
     run_script = command_header() + f"""python3 -u "$ROOT/installer/install.py" --update-check --install-path "$ROOT" || true
-if /usr/sbin/lsof -nP -iTCP:8188 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "[AKSHO COMFY] ERROR: Port 8188 is already in use. Quit the other ComfyUI, then run this again."
+if /usr/sbin/lsof -nP -iTCP:{COMFY_INTERNAL_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "[AKSHO COMFY] ERROR: Aksho ComfyUI is already running."
   exit 1
 fi
-echo "[AKSHO COMFY] Starting ComfyUI on port 8188..."
-exec "$ROOT/.venv/bin/python" -s "$ROOT/ComfyUI/main.py" {' '.join(COMFY_ARGS)}
+python3 -c 'import pathlib, sys; sys.path.insert(0, "'"$ROOT"'/installer"); import bootstrap_comfy; bootstrap_comfy.patch_browser_cors(pathlib.Path("'"$ROOT"'") / "ComfyUI")'
+python3 "$ROOT/installer/browser_bridge.py" --root "$ROOT"
+cleanup() {{
+  python3 "$ROOT/installer/browser_bridge.py" --root "$ROOT" --stop || true
+}}
+trap cleanup EXIT HUP
+echo "[AKSHO COMFY] Starting ComfyUI on port {COMFY_PORT}..."
+"$ROOT/.venv/bin/python" -s "$ROOT/ComfyUI/main.py" {' '.join(COMFY_ARGS)}
 """
     update_script = command_header() + """python3 -u "$ROOT/installer/install.py" --no-launch --install-path "$ROOT"
 echo
